@@ -1,0 +1,6 @@
+__pycache__
+scripts
+src/__pycache__
+src/data
+src/results
+src/raw_data_samples.ipynb
