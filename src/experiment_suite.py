@@ -94,23 +94,44 @@ class GraphBundle:
 
 
 class ResourceTracker:
-    """Track elapsed time and peak memory during a training or search run."""
+    """Track elapsed time plus CPU, RAM, and GPU resource usage for one run."""
 
     def __init__(self) -> None:
         self.start_time = 0.0
         self.peak_ram_mb = 0.0
         self.peak_gpu_mb = 0.0
+        self.peak_cpu_percent = 0.0
+        self.avg_cpu_percent = 0.0
+        self.cpu_sample_count = 0
+        self.start_cpu_user_sec = 0.0
+        self.start_cpu_system_sec = 0.0
+        self.process: psutil.Process | None = None
 
     def tick(self) -> None:
-        if psutil is not None:
-            ram = psutil.Process(os.getpid()).memory_info().rss / (1024**2)
+        if self.process is not None:
+            ram = self.process.memory_info().rss / (1024**2)
             self.peak_ram_mb = max(self.peak_ram_mb, ram)
+            # cpu_percent(None) reports process CPU usage since the previous
+            # call. Repeated samples let the experiment log both peak and
+            # average CPU pressure without needing a separate profiler.
+            cpu_percent = self.process.cpu_percent(interval=None)
+            self.peak_cpu_percent = max(self.peak_cpu_percent, cpu_percent)
+            self.cpu_sample_count += 1
+            self.avg_cpu_percent += (cpu_percent - self.avg_cpu_percent) / self.cpu_sample_count
         if torch.cuda.is_available():
             gpu = torch.cuda.max_memory_allocated() / (1024**2)
             self.peak_gpu_mb = max(self.peak_gpu_mb, gpu)
 
     def __enter__(self) -> "ResourceTracker":
         self.start_time = time.perf_counter()
+        if psutil is not None:
+            self.process = psutil.Process(os.getpid())
+            cpu_times = self.process.cpu_times()
+            self.start_cpu_user_sec = cpu_times.user
+            self.start_cpu_system_sec = cpu_times.system
+            # Prime psutil's non-blocking CPU sampler so later tick() calls
+            # measure usage over each training/search interval.
+            self.process.cpu_percent(interval=None)
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         self.tick()
@@ -120,10 +141,20 @@ class ResourceTracker:
         self.tick()
 
     def summary(self) -> dict:
+        cpu_user_sec = 0.0
+        cpu_system_sec = 0.0
+        if self.process is not None:
+            cpu_times = self.process.cpu_times()
+            cpu_user_sec = cpu_times.user - self.start_cpu_user_sec
+            cpu_system_sec = cpu_times.system - self.start_cpu_system_sec
         return {
             "wall_time_sec": time.perf_counter() - self.start_time,
             "peak_ram_mb": self.peak_ram_mb,
             "peak_gpu_mb": self.peak_gpu_mb,
+            "peak_cpu_percent": self.peak_cpu_percent,
+            "avg_cpu_percent": self.avg_cpu_percent,
+            "cpu_user_sec": cpu_user_sec,
+            "cpu_system_sec": cpu_system_sec,
         }
 
 
@@ -761,10 +792,10 @@ def _train_gradient(bundle_cpu: GraphBundle, model_name: str, hparams: dict, opt
     }
 
 
-def train_population_recommender(bundle_cpu: GraphBundle, method: str, device: torch.device) -> dict:
-    """Optimize the same DNN's weights directly with PSO or evolution strategies."""
+def train_population_recommender(bundle_cpu: GraphBundle, model_name: str, method: str, device: torch.device) -> dict:
+    """Optimize one recommender's weights directly with PSO or evolution strategies."""
     bundle_device = move_bundle_to_device(bundle_cpu, device)
-    model = EmbeddingMLPRecommender(bundle_device, embedding_dim=16, hidden_dim=32, dropout=0.1, lr=3e-3).to(device)
+    model = MODEL_REGISTRY[model_name](bundle_device, embedding_dim=16, hidden_dim=32, dropout=0.1, lr=3e-3).to(device)
     pairs, labels = make_train_batch(bundle_cpu, 256, 1, np.random.default_rng(SEED))
     pairs, labels = pairs.to(device), labels.to(device)
     base = parameters_to_vector(model.parameters()).detach()
@@ -825,7 +856,7 @@ def train_population_recommender(bundle_cpu: GraphBundle, method: str, device: t
     return {
         "suite": "optimizer_training",
         "dataset": bundle_cpu.name,
-        "model": "dnn",
+        "model": model_name,
         "method": method,
         "val_auc": val_metrics["auc"],
         "val_ap": val_metrics["average_precision"],
@@ -954,15 +985,16 @@ def run_de_search(bundle_cpu: GraphBundle, model_name: str, device: torch.device
 
 
 def run_optimizer_suite(bundle_cpu: GraphBundle, device: torch.device) -> list[dict]:
-    """Compare gradient and population-based training on the same baseline model."""
+    """Compare gradient and population-based training on one dataset-appropriate model."""
     epochs = DEFAULT_CONFIG["optimizer_epochs_small"] if bundle_cpu.name == "movielens_100k" else DEFAULT_CONFIG["optimizer_epochs_large"]
     steps = DEFAULT_CONFIG["optimizer_steps_small"] if bundle_cpu.name == "movielens_100k" else DEFAULT_CONFIG["optimizer_steps_large"]
+    model_name = "dnn" if bundle_cpu.task_type == "bipartite" else "gnn"
     hparams = {"embedding_dim": 32, "hidden_dim": 64, "dropout": 0.2, "lr": 3e-3}
     return [
-        _train_gradient(bundle_cpu, "dnn", hparams, "adam", epochs, steps, "optimizer_training", device),
-        _train_gradient(bundle_cpu, "dnn", hparams, "sgd", epochs, steps, "optimizer_training", device),
-        train_population_recommender(bundle_cpu, "pso", device),
-        train_population_recommender(bundle_cpu, "evolutionary", device),
+        _train_gradient(bundle_cpu, model_name, hparams, "adam", epochs, steps, "optimizer_training", device),
+        _train_gradient(bundle_cpu, model_name, hparams, "sgd", epochs, steps, "optimizer_training", device),
+        train_population_recommender(bundle_cpu, model_name, "pso", device),
+        train_population_recommender(bundle_cpu, model_name, "evolutionary", device),
     ]
 
 
