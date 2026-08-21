@@ -49,12 +49,13 @@ except Exception as exc:
     OGB_IMPORT_ERROR = exc
 
 
-SEED = 42
-ROOT = Path.cwd()
-DATA_DIR = ROOT / "data"
-RESULTS_DIR = ROOT / "results"
-DATA_DIR.mkdir(exist_ok=True)
-RESULTS_DIR.mkdir(exist_ok=True)
+SEEDS = (42, 123, 456, 789, 2026)
+SEED = SEEDS[0]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_ROOT / "data"
+RESULTS_DIR = PROJECT_ROOT / "results"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def set_seed(seed: int = SEED) -> None:
@@ -750,9 +751,23 @@ def evaluate_model(model: nn.Module, bundle_cpu: GraphBundle, bundle_device: Gra
     return score_metrics(torch.cat(pos_logits), torch.cat(neg_logits))
 
 
-def _train_gradient(bundle_cpu: GraphBundle, model_name: str, hparams: dict, optimizer_name: str, epochs: int, steps: int, suite: str, device: torch.device) -> dict:
+def _train_gradient(
+    bundle_cpu: GraphBundle,
+    model_name: str,
+    hparams: dict,
+    optimizer_name: str,
+    epochs: int,
+    steps: int,
+    suite: str,
+    device: torch.device,
+    seed: int = SEED,
+    evaluate_test_set: bool = True,
+) -> dict:
     """Train one model with a gradient optimizer and return a flat result row."""
-    rng = np.random.default_rng(SEED)
+    # Reset every source of model-training randomness so comparisons start from
+    # the same reproducible state and a selected HPO run can be reconstructed.
+    set_seed(seed)
+    rng = np.random.default_rng(seed)
     bundle_device = move_bundle_to_device(bundle_cpu, device)
     model = MODEL_REGISTRY[model_name](bundle_device, **hparams).to(device)
     lr = hparams.get("lr", getattr(model, "lr", 3e-3))
@@ -772,7 +787,16 @@ def _train_gradient(bundle_cpu: GraphBundle, model_name: str, hparams: dict, opt
                 losses.append(float(loss.item()))
                 tracker.tick()
         val_metrics = evaluate_model(model, bundle_cpu, bundle_device, bundle_cpu.val_pos, bundle_cpu.val_neg)
-        test_metrics = evaluate_model(model, bundle_cpu, bundle_device, bundle_cpu.test_pos, bundle_cpu.test_neg)
+        if evaluate_test_set:
+            test_metrics = evaluate_model(model, bundle_cpu, bundle_device, bundle_cpu.test_pos, bundle_cpu.test_neg)
+        else:
+            # Hyperparameter candidates must not inspect the test set. NaNs keep
+            # the result schema stable while making accidental use conspicuous.
+            test_metrics = {
+                "auc": float("nan"),
+                "average_precision": float("nan"),
+                "binary_accuracy": float("nan"),
+            }
         tracker.tick()
         summary = tracker.summary()
     return {
@@ -787,16 +811,19 @@ def _train_gradient(bundle_cpu: GraphBundle, model_name: str, hparams: dict, opt
         "test_ap": test_metrics["average_precision"],
         "test_accuracy": test_metrics["binary_accuracy"],
         "loss_tail": float(np.mean(losses[-10:])) if losses else float("nan"),
+        "evaluated_on_test": evaluate_test_set,
+        "seed": seed,
         **summary,
         "notes": "",
     }
 
 
-def train_population_recommender(bundle_cpu: GraphBundle, model_name: str, method: str, device: torch.device) -> dict:
+def train_population_recommender(bundle_cpu: GraphBundle, model_name: str, method: str, device: torch.device, seed: int = SEED) -> dict:
     """Optimize one recommender's weights directly with PSO or evolution strategies."""
+    set_seed(seed)
     bundle_device = move_bundle_to_device(bundle_cpu, device)
     model = MODEL_REGISTRY[model_name](bundle_device, embedding_dim=16, hidden_dim=32, dropout=0.1, lr=3e-3).to(device)
-    pairs, labels = make_train_batch(bundle_cpu, 256, 1, np.random.default_rng(SEED))
+    pairs, labels = make_train_batch(bundle_cpu, 256, 1, np.random.default_rng(seed))
     pairs, labels = pairs.to(device), labels.to(device)
     base = parameters_to_vector(model.parameters()).detach()
     dim = base.numel()
@@ -812,7 +839,7 @@ def train_population_recommender(bundle_cpu: GraphBundle, model_name: str, metho
         if method == "pso":
             # Particle swarm tracks personal and global best candidates.
             pop, iters = 10, 20 if bundle_cpu.name == "movielens_100k" else 12
-            rng = np.random.default_rng(SEED)
+            rng = np.random.default_rng(seed)
             pos = np.tile(base.cpu().numpy(), (pop, 1)) + 0.05 * rng.standard_normal((pop, dim))
             vel = np.zeros_like(pos)
             pbest = pos.copy()
@@ -835,7 +862,7 @@ def train_population_recommender(bundle_cpu: GraphBundle, model_name: str, metho
             # This is a compact evolution-strategy loop that nudges the search
             # center toward better random perturbations.
             sigma, es_lr, pop, iters = 0.05, 0.03, 18, 18 if bundle_cpu.name == "movielens_100k" else 10
-            rng = np.random.default_rng(SEED)
+            rng = np.random.default_rng(seed)
             center = base.cpu().numpy().copy()
             best, best_score = center.copy(), objective(center)
             for _ in range(iters):
@@ -865,14 +892,17 @@ def train_population_recommender(bundle_cpu: GraphBundle, model_name: str, metho
         "test_ap": test_metrics["average_precision"],
         "test_accuracy": test_metrics["binary_accuracy"],
         "loss_tail": float("nan"),
+        "evaluated_on_test": True,
+        "seed": seed,
         **summary,
         "notes": "Population-based training on the same neural recommender.",
     }
 
 
-def train_rl_family_model(bundle_cpu: GraphBundle, hparams: dict, epochs: int, steps: int, device: torch.device) -> dict:
+def train_rl_family_model(bundle_cpu: GraphBundle, hparams: dict, epochs: int, steps: int, device: torch.device, seed: int = SEED) -> dict:
     """Train the RL-style hybrid by alternating supervised learning and bandit updates."""
-    rng = np.random.default_rng(SEED)
+    set_seed(seed)
+    rng = np.random.default_rng(seed)
     bundle_device = move_bundle_to_device(bundle_cpu, device)
     model = RLBanditAggregationRecommender(bundle_device, **hparams).to(device)
     optimizer = torch.optim.Adam([p for name, p in model.named_parameters() if name != "policy_logits"], lr=hparams.get("lr", 3e-3))
@@ -910,37 +940,119 @@ def train_rl_family_model(bundle_cpu: GraphBundle, hparams: dict, epochs: int, s
         "test_ap": test_metrics["average_precision"],
         "test_accuracy": test_metrics["binary_accuracy"],
         "loss_tail": float("nan"),
+        "evaluated_on_test": True,
+        "seed": seed,
         **summary,
         "notes": f"selected_expert={model.experts[best_idx]}",
     }
 
 
-def evaluate_hparams(bundle_cpu: GraphBundle, model_name: str, hparams: dict, device: torch.device) -> dict:
-    """Train a short run for one hyperparameter configuration."""
+def evaluate_hparams(bundle_cpu: GraphBundle, model_name: str, hparams: dict, device: torch.device, seed: int) -> dict:
+    """Evaluate one hyperparameter candidate using validation data only."""
     epochs = DEFAULT_CONFIG["hpo_epochs_small"] if bundle_cpu.name == "movielens_100k" else DEFAULT_CONFIG["hpo_epochs_large"]
     steps = DEFAULT_CONFIG["hpo_steps_small"] if bundle_cpu.name == "movielens_100k" else DEFAULT_CONFIG["hpo_steps_large"]
-    return _train_gradient(bundle_cpu, model_name, hparams, "adam", epochs, steps, "hyperparameter_search", device)
+    row = _train_gradient(
+        bundle_cpu,
+        model_name,
+        hparams,
+        "adam",
+        epochs,
+        steps,
+        "hyperparameter_search",
+        device,
+        seed=seed,
+        evaluate_test_set=False,
+    )
+    row["selection_stage"] = "validation_search"
+    return row
 
 
-def run_grid_search(bundle_cpu: GraphBundle, model_name: str, device: torch.device) -> list[dict]:
+def evaluate_selected_hparams(
+    bundle_cpu: GraphBundle,
+    model_name: str,
+    hparams: dict,
+    method: str,
+    device: torch.device,
+    seed: int,
+) -> dict:
+    """Retrain a validation-selected configuration and evaluate one test trial."""
+    epochs = DEFAULT_CONFIG["hpo_epochs_small"] if bundle_cpu.name == "movielens_100k" else DEFAULT_CONFIG["hpo_epochs_large"]
+    steps = DEFAULT_CONFIG["hpo_steps_small"] if bundle_cpu.name == "movielens_100k" else DEFAULT_CONFIG["hpo_steps_large"]
+    row = _train_gradient(
+        bundle_cpu,
+        model_name,
+        hparams,
+        "adam",
+        epochs,
+        steps,
+        "hyperparameter_search",
+        device,
+        seed=seed,
+        evaluate_test_set=True,
+    )
+    row["method"] = method
+    row["selection_stage"] = "final_test"
+    row["notes"] = "Validation-selected configuration: " + ", ".join(f"{key}={value}" for key, value in hparams.items())
+    return row
+
+
+def evaluate_hparams_across_seeds(
+    bundle_cpu: GraphBundle,
+    model_name: str,
+    hparams: dict,
+    method: str,
+    device: torch.device,
+    seeds: tuple[int, ...],
+) -> tuple[list[dict], float]:
+    """Return validation-only trials and their mean AUC for one candidate."""
+    rows = []
+    notes = ", ".join(f"{key}={value}" for key, value in hparams.items())
+    for seed in seeds:
+        row = evaluate_hparams(bundle_cpu, model_name, hparams, device, seed)
+        row["method"] = method
+        row["notes"] = notes
+        rows.append(row)
+    return rows, float(np.mean([row["val_auc"] for row in rows]))
+
+
+def evaluate_selected_across_seeds(
+    bundle_cpu: GraphBundle,
+    model_name: str,
+    hparams: dict,
+    method: str,
+    device: torch.device,
+    seeds: tuple[int, ...],
+) -> list[dict]:
+    """Evaluate the validation-selected configuration once per trial seed."""
+    return [evaluate_selected_hparams(bundle_cpu, model_name, hparams, method, device, seed) for seed in seeds]
+
+
+def run_grid_search(bundle_cpu: GraphBundle, model_name: str, device: torch.device, seeds: tuple[int, ...] = SEEDS) -> list[dict]:
     """Enumerate a small structured grid of hyperparameters."""
     rows = []
+    candidates = []
     grid = itertools.product(HPO_SPACE["embedding_dim"][:2], HPO_SPACE["hidden_dim"][:2], HPO_SPACE["dropout"][:3], HPO_SPACE["lr"][:2])
     for emb, hid, drop, lr in grid:
-        row = evaluate_hparams(bundle_cpu, model_name, {"embedding_dim": emb, "hidden_dim": hid, "dropout": drop, "lr": lr}, device)
-        row["method"], row["notes"] = "grid_search", f"embedding_dim={emb}, hidden_dim={hid}, dropout={drop}, lr={lr}"
-        rows.append(row)
+        hparams = {"embedding_dim": emb, "hidden_dim": hid, "dropout": drop, "lr": lr}
+        candidate_rows, mean_val_auc = evaluate_hparams_across_seeds(bundle_cpu, model_name, hparams, "grid_search", device, seeds)
+        rows.extend(candidate_rows)
+        candidates.append((mean_val_auc, hparams))
+    best_hparams = max(candidates, key=lambda candidate: candidate[0])[1]
+    rows.extend(evaluate_selected_across_seeds(bundle_cpu, model_name, best_hparams, "grid_search", device, seeds))
     return rows
 
 
-def run_random_search(bundle_cpu: GraphBundle, model_name: str, device: torch.device, trials: int = 8) -> list[dict]:
+def run_random_search(bundle_cpu: GraphBundle, model_name: str, device: torch.device, trials: int = 8, seeds: tuple[int, ...] = SEEDS) -> list[dict]:
     """Sample hyperparameters independently from the predefined search space."""
     rows, rng = [], np.random.default_rng(SEED)
+    candidates = []
     for _ in range(trials):
         candidate = {k: (float(rng.choice(v)) if k in {"dropout", "lr"} else int(rng.choice(v))) for k, v in HPO_SPACE.items()}
-        row = evaluate_hparams(bundle_cpu, model_name, candidate, device)
-        row["method"], row["notes"] = "random_search", ", ".join(f"{k}={v}" for k, v in candidate.items())
-        rows.append(row)
+        candidate_rows, mean_val_auc = evaluate_hparams_across_seeds(bundle_cpu, model_name, candidate, "random_search", device, seeds)
+        rows.extend(candidate_rows)
+        candidates.append((mean_val_auc, candidate))
+    best_hparams = max(candidates, key=lambda candidate: candidate[0])[1]
+    rows.extend(evaluate_selected_across_seeds(bundle_cpu, model_name, best_hparams, "random_search", device, seeds))
     return rows
 
 
@@ -954,7 +1066,7 @@ def decode_de_vector(vector: np.ndarray) -> dict:
     }
 
 
-def run_de_search(bundle_cpu: GraphBundle, model_name: str, device: torch.device) -> list[dict]:
+def run_de_search(bundle_cpu: GraphBundle, model_name: str, device: torch.device, seeds: tuple[int, ...] = SEEDS) -> list[dict]:
     """Run a differential-evolution-style population search over hyperparameters."""
     rng, rows = np.random.default_rng(SEED), []
     pop, gens = 6, 4 if bundle_cpu.name == "movielens_100k" else 3
@@ -962,9 +1074,9 @@ def run_de_search(bundle_cpu: GraphBundle, model_name: str, device: torch.device
     population = np.column_stack([rng.uniform(bounds[i, 0], bounds[i, 1], size=pop) for i in range(bounds.shape[0])])
     scores = []
     for cand in population:
-        row = evaluate_hparams(bundle_cpu, model_name, decode_de_vector(cand), device)
-        rows.append(row)
-        scores.append(row["val_auc"])
+        candidate_rows, mean_val_auc = evaluate_hparams_across_seeds(bundle_cpu, model_name, decode_de_vector(cand), "de_opt", device, seeds)
+        rows.extend(candidate_rows)
+        scores.append(mean_val_auc)
     for _ in range(gens):
         for idx in range(pop):
             pool = [i for i in range(pop) if i != idx]
@@ -974,49 +1086,57 @@ def run_de_search(bundle_cpu: GraphBundle, model_name: str, device: torch.device
             if not mask.any():
                 mask[rng.integers(0, 4)] = True
             trial = np.clip(np.where(mask, mutant, population[idx]), bounds[:, 0], bounds[:, 1])
-            row = evaluate_hparams(bundle_cpu, model_name, decode_de_vector(trial), device)
-            if row["val_auc"] >= scores[idx]:
-                population[idx], scores[idx] = trial, row["val_auc"]
-                rows.append(row)
-    for row in rows:
-        row["method"] = "de_opt"
-        row["notes"] = row["notes"] or "Differential-evolution-style search."
+            candidate_rows, mean_val_auc = evaluate_hparams_across_seeds(bundle_cpu, model_name, decode_de_vector(trial), "de_opt", device, seeds)
+            rows.extend(candidate_rows)
+            if mean_val_auc >= scores[idx]:
+                population[idx], scores[idx] = trial, mean_val_auc
+    best_hparams = decode_de_vector(population[int(np.argmax(scores))])
+    rows.extend(evaluate_selected_across_seeds(bundle_cpu, model_name, best_hparams, "de_opt", device, seeds))
     return rows
 
 
-def run_optimizer_suite(bundle_cpu: GraphBundle, device: torch.device) -> list[dict]:
+def run_optimizer_suite(bundle_cpu: GraphBundle, device: torch.device, seeds: tuple[int, ...] = SEEDS) -> list[dict]:
     """Compare gradient and population-based training on one dataset-appropriate model."""
     epochs = DEFAULT_CONFIG["optimizer_epochs_small"] if bundle_cpu.name == "movielens_100k" else DEFAULT_CONFIG["optimizer_epochs_large"]
     steps = DEFAULT_CONFIG["optimizer_steps_small"] if bundle_cpu.name == "movielens_100k" else DEFAULT_CONFIG["optimizer_steps_large"]
     model_name = "dnn" if bundle_cpu.task_type == "bipartite" else "gnn"
     hparams = {"embedding_dim": 32, "hidden_dim": 64, "dropout": 0.2, "lr": 3e-3}
-    return [
-        _train_gradient(bundle_cpu, model_name, hparams, "adam", epochs, steps, "optimizer_training", device),
-        _train_gradient(bundle_cpu, model_name, hparams, "sgd", epochs, steps, "optimizer_training", device),
-        train_population_recommender(bundle_cpu, model_name, "pso", device),
-        train_population_recommender(bundle_cpu, model_name, "evolutionary", device),
-    ]
+    rows = []
+    for seed in seeds:
+        rows.extend(
+            [
+                _train_gradient(bundle_cpu, model_name, hparams, "adam", epochs, steps, "optimizer_training", device, seed=seed),
+                _train_gradient(bundle_cpu, model_name, hparams, "sgd", epochs, steps, "optimizer_training", device, seed=seed),
+                train_population_recommender(bundle_cpu, model_name, "pso", device, seed=seed),
+                train_population_recommender(bundle_cpu, model_name, "evolutionary", device, seed=seed),
+            ]
+        )
+    return rows
 
 
-def run_hpo_suite(bundle_cpu: GraphBundle, device: torch.device) -> list[dict]:
+def run_hpo_suite(bundle_cpu: GraphBundle, device: torch.device, seeds: tuple[int, ...] = SEEDS) -> list[dict]:
     """Compare classical and population-based hyperparameter search strategies."""
     model_name = "dnn" if bundle_cpu.task_type == "bipartite" else "gnn"
-    return run_grid_search(bundle_cpu, model_name, device) + run_random_search(bundle_cpu, model_name, device) + run_de_search(bundle_cpu, model_name, device)
+    return run_grid_search(bundle_cpu, model_name, device, seeds) + run_random_search(bundle_cpu, model_name, device, seeds=seeds) + run_de_search(bundle_cpu, model_name, device, seeds)
 
 
-def run_model_family_suite(bundle_cpu: GraphBundle, device: torch.device) -> list[dict]:
+def run_model_family_suite(bundle_cpu: GraphBundle, device: torch.device, seeds: tuple[int, ...] = SEEDS) -> list[dict]:
     """Train the baseline and hybrid model families under one shared protocol."""
     epochs = DEFAULT_CONFIG["family_epochs_small"] if bundle_cpu.name == "movielens_100k" else DEFAULT_CONFIG["family_epochs_large"]
     steps = DEFAULT_CONFIG["family_steps_small"] if bundle_cpu.name == "movielens_100k" else DEFAULT_CONFIG["family_steps_large"]
     hparams = {"embedding_dim": 32, "hidden_dim": 64, "dropout": 0.2, "lr": 3e-3}
-    rows = [
-        _train_gradient(bundle_cpu, "dnn", hparams, "adam", epochs, steps, "model_family", device),
-        _train_gradient(bundle_cpu, "gnn", hparams, "adam", epochs, steps, "model_family", device),
-        _train_gradient(bundle_cpu, "rhmm", hparams, "adam", epochs, steps, "model_family", device),
-        _train_gradient(bundle_cpu, "psl_dnn", hparams, "adam", epochs, steps, "model_family", device),
-        _train_gradient(bundle_cpu, "gnn_bilstm", hparams, "adam", epochs, steps, "model_family", device),
-        train_rl_family_model(bundle_cpu, hparams, epochs, steps, device),
-    ]
+    rows = []
+    for seed in seeds:
+        rows.extend(
+            [
+                _train_gradient(bundle_cpu, "dnn", hparams, "adam", epochs, steps, "model_family", device, seed=seed),
+                _train_gradient(bundle_cpu, "gnn", hparams, "adam", epochs, steps, "model_family", device, seed=seed),
+                _train_gradient(bundle_cpu, "rhmm", hparams, "adam", epochs, steps, "model_family", device, seed=seed),
+                _train_gradient(bundle_cpu, "psl_dnn", hparams, "adam", epochs, steps, "model_family", device, seed=seed),
+                _train_gradient(bundle_cpu, "gnn_bilstm", hparams, "adam", epochs, steps, "model_family", device, seed=seed),
+                train_rl_family_model(bundle_cpu, hparams, epochs, steps, device, seed=seed),
+            ]
+        )
     return rows
 
 

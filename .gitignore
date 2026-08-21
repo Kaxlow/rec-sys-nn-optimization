@@ -4,11 +4,13 @@ __pycache__/
 *$py.class
 
 # Project-specific generated or local files
-scripts
-src/__pycache__/
-src/data
-src/results
-src/raw_data_samples.ipynb
+/data/
+/results/raw/
+/artifacts/
+/.vscode/
+/src/data/
+/src/results/
+/src/raw_data_samples.ipynb
 
 # C extensions
 *.so

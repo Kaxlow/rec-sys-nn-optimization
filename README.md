@@ -44,3 +44,18 @@ src/recommender_optimization_experiments.ipynb
 
 The experiment suite will create local `data/` and `results/` directories as
 needed.
+
+## Evaluation protocol
+
+Model parameters are learned from the training split. Hyperparameter-search
+candidates are compared using mean validation AUC over five shared trial seeds;
+their test metrics are left unset. After each search method selects the
+configuration with the highest mean validation AUC, that configuration is
+retrained and evaluated on the test split once per seed. Final tables report the
+mean and standard deviation across those trials. This keeps the test set
+independent of hyperparameter selection while measuring sensitivity to random
+initialization and sampling.
+
+The default trial seeds are `42`, `123`, `456`, `789`, and `2026`. Dataset
+caches and result files are anchored to this repository's root-level `data/`
+and `results/` directories regardless of the process's working directory.
