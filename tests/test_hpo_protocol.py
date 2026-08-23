@@ -47,10 +47,7 @@ class HyperparameterProtocolTests(unittest.TestCase):
 
     def test_grid_search_selects_by_validation_auc(self) -> None:
         def validation_row(bundle, model, hparams, device, seed):
-            validation_scores = {
-                16: {1: 0.9, 2: 0.1},
-                32: {1: 0.4, 2: 0.4},
-            }
+            validation_scores = {16: {1: 0.9, 2: 0.1}, 32: {1: 0.4, 2: 0.4}, 48: {1: 0.3, 2: 0.3}}
             return {
                 "val_auc": validation_scores[hparams["embedding_dim"]][seed],
                 "test_auc": float("nan"),
@@ -85,7 +82,43 @@ class HyperparameterProtocolTests(unittest.TestCase):
         # 0.4), even though the 32-dimensional candidate wins for seed 2.
         self.assertEqual(final_rows[0]["hparams"]["embedding_dim"], 16)
         candidate_rows = [row for row in rows if not row["evaluated_on_test"]]
+        self.assertEqual(len(candidate_rows), suite.HPO_EVAL_BUDGET * 2)
         self.assertTrue(all(row["test_auc"] != row["test_auc"] for row in candidate_rows))
+
+    def test_every_hpo_method_uses_the_shared_candidate_budget(self) -> None:
+        def validation_row(bundle, model, hparams, device, seed):
+            return {
+                "val_auc": 1.0 - abs(hparams["dropout"] - 0.1),
+                "test_auc": float("nan"),
+                "evaluated_on_test": False,
+                "seed": seed,
+                "method": "",
+                "notes": "",
+            }
+
+        def final_row(bundle, model, hparams, method, device, seed):
+            return {
+                "val_auc": 0.5,
+                "test_auc": 0.5,
+                "evaluated_on_test": True,
+                "seed": seed,
+                "selection_stage": "final_test",
+                "method": method,
+                "notes": "",
+            }
+
+        with (
+            patch.object(suite, "evaluate_hparams", side_effect=validation_row),
+            patch.object(suite, "evaluate_selected_hparams", side_effect=final_row),
+        ):
+            rows = suite.run_hpo_suite(self.bundle, "cpu", seeds=(1,))
+
+        validation_rows = [row for row in rows if not row["evaluated_on_test"]]
+        counts = {
+            method: sum(row["method"] == method for row in validation_rows)
+            for method in ("grid_search", "random_search", "de_opt")
+        }
+        self.assertEqual(counts, {method: suite.HPO_EVAL_BUDGET for method in counts})
 
     def test_project_paths_do_not_depend_on_working_directory(self) -> None:
         expected_root = Path(suite.__file__).resolve().parents[1]
@@ -97,11 +130,14 @@ class HyperparameterProtocolTests(unittest.TestCase):
         def gradient_row(*args, seed, **kwargs):
             return {"method": args[3], "seed": seed}
 
-        def population_row(bundle, model, method, device, seed):
+        population_hparams = []
+
+        def population_row(bundle, model, method, hparams, device, seed):
+            population_hparams.append(hparams)
             return {"method": method, "seed": seed}
 
         with (
-            patch.object(suite, "_train_gradient", side_effect=gradient_row),
+            patch.object(suite, "_train_gradient", side_effect=gradient_row) as gradient_mock,
             patch.object(suite, "train_population_recommender", side_effect=population_row),
         ):
             rows = suite.run_optimizer_suite(self.bundle, "cpu", seeds=(11, 22))
@@ -110,6 +146,9 @@ class HyperparameterProtocolTests(unittest.TestCase):
         for method in ("adam", "sgd", "pso", "evolutionary"):
             method_seeds = {row["seed"] for row in rows if row["method"] == method}
             self.assertEqual(method_seeds, {11, 22})
+        self.assertTrue(all(hparams == suite.OPTIMIZER_HPARAMS for hparams in population_hparams))
+        gradient_hparams = [call.args[2] for call in gradient_mock.call_args_list]
+        self.assertTrue(all(hparams == suite.OPTIMIZER_HPARAMS for hparams in gradient_hparams))
 
 
 if __name__ == "__main__":

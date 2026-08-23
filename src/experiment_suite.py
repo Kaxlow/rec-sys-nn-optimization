@@ -699,8 +699,8 @@ MODEL_REGISTRY = {
     "rl_gnn": RLBanditAggregationRecommender,
 }
 
-# Shared experiment knobs keep the notebook readable and make quick/full runs
-# easy to control from one place.
+# Shared training knobs keep the notebook readable. QUICK_MODE is handled by
+# the dataset loaders and does not alter these epoch or mini-batch schedules.
 DEFAULT_CONFIG = {
     "history_len": 10,
     "batch_size": 512,
@@ -719,11 +719,21 @@ DEFAULT_CONFIG = {
     "hpo_steps_large": 12,
 }
 
-HPO_SPACE = {
-    "embedding_dim": [16, 32, 48],
-    "hidden_dim": [32, 64, 96],
-    "dropout": [0.0, 0.1, 0.2, 0.3],
-    "lr": [1e-3, 3e-3, 1e-2],
+HPO_EVAL_BUDGET = 24
+HPO_DOMAIN = {
+    "embedding_dim": (16, 32, 48),
+    "hidden_dim": (32, 64, 96),
+    "dropout": (0.0, 0.35),
+    "log10_lr": (-3.2, -2.0),
+}
+
+# Use one deliberately small architecture for every optimizer so optimizer
+# effects are not confounded with model size.
+OPTIMIZER_HPARAMS = {
+    "embedding_dim": 16,
+    "hidden_dim": 32,
+    "dropout": 0.1,
+    "lr": 3e-3,
 }
 
 
@@ -818,11 +828,18 @@ def _train_gradient(
     }
 
 
-def train_population_recommender(bundle_cpu: GraphBundle, model_name: str, method: str, device: torch.device, seed: int = SEED) -> dict:
+def train_population_recommender(
+    bundle_cpu: GraphBundle,
+    model_name: str,
+    method: str,
+    hparams: dict,
+    device: torch.device,
+    seed: int = SEED,
+) -> dict:
     """Optimize one recommender's weights directly with PSO or evolution strategies."""
     set_seed(seed)
     bundle_device = move_bundle_to_device(bundle_cpu, device)
-    model = MODEL_REGISTRY[model_name](bundle_device, embedding_dim=16, hidden_dim=32, dropout=0.1, lr=3e-3).to(device)
+    model = MODEL_REGISTRY[model_name](bundle_device, **hparams).to(device)
     pairs, labels = make_train_batch(bundle_cpu, 256, 1, np.random.default_rng(seed))
     pairs, labels = pairs.to(device), labels.to(device)
     base = parameters_to_vector(model.parameters()).detach()
@@ -1028,10 +1045,15 @@ def evaluate_selected_across_seeds(
 
 
 def run_grid_search(bundle_cpu: GraphBundle, model_name: str, device: torch.device, seeds: tuple[int, ...] = SEEDS) -> list[dict]:
-    """Enumerate a small structured grid of hyperparameters."""
+    """Evaluate a 24-point lattice spanning the shared HPO domain."""
     rows = []
     candidates = []
-    grid = itertools.product(HPO_SPACE["embedding_dim"][:2], HPO_SPACE["hidden_dim"][:2], HPO_SPACE["dropout"][:3], HPO_SPACE["lr"][:2])
+    grid = itertools.product(
+        HPO_DOMAIN["embedding_dim"],
+        (HPO_DOMAIN["hidden_dim"][0], HPO_DOMAIN["hidden_dim"][-1]),
+        HPO_DOMAIN["dropout"],
+        tuple(10**value for value in HPO_DOMAIN["log10_lr"]),
+    )
     for emb, hid, drop, lr in grid:
         hparams = {"embedding_dim": emb, "hidden_dim": hid, "dropout": drop, "lr": lr}
         candidate_rows, mean_val_auc = evaluate_hparams_across_seeds(bundle_cpu, model_name, hparams, "grid_search", device, seeds)
@@ -1042,12 +1064,23 @@ def run_grid_search(bundle_cpu: GraphBundle, model_name: str, device: torch.devi
     return rows
 
 
-def run_random_search(bundle_cpu: GraphBundle, model_name: str, device: torch.device, trials: int = 8, seeds: tuple[int, ...] = SEEDS) -> list[dict]:
-    """Sample hyperparameters independently from the predefined search space."""
+def run_random_search(
+    bundle_cpu: GraphBundle,
+    model_name: str,
+    device: torch.device,
+    trials: int = HPO_EVAL_BUDGET,
+    seeds: tuple[int, ...] = SEEDS,
+) -> list[dict]:
+    """Sample 24 independent candidates from the shared HPO domain."""
     rows, rng = [], np.random.default_rng(SEED)
     candidates = []
     for _ in range(trials):
-        candidate = {k: (float(rng.choice(v)) if k in {"dropout", "lr"} else int(rng.choice(v))) for k, v in HPO_SPACE.items()}
+        candidate = {
+            "embedding_dim": int(rng.choice(HPO_DOMAIN["embedding_dim"])),
+            "hidden_dim": int(rng.choice(HPO_DOMAIN["hidden_dim"])),
+            "dropout": float(rng.uniform(*HPO_DOMAIN["dropout"])),
+            "lr": float(10 ** rng.uniform(*HPO_DOMAIN["log10_lr"])),
+        }
         candidate_rows, mean_val_auc = evaluate_hparams_across_seeds(bundle_cpu, model_name, candidate, "random_search", device, seeds)
         rows.extend(candidate_rows)
         candidates.append((mean_val_auc, candidate))
@@ -1058,19 +1091,30 @@ def run_random_search(bundle_cpu: GraphBundle, model_name: str, device: torch.de
 
 def decode_de_vector(vector: np.ndarray) -> dict:
     """Map a continuous DE candidate vector into valid discrete model hyperparameters."""
+    embedding_values = np.asarray(HPO_DOMAIN["embedding_dim"])
+    hidden_values = np.asarray(HPO_DOMAIN["hidden_dim"])
     return {
-        "embedding_dim": int(np.clip(np.round(vector[0] / 16) * 16, 16, 48)),
-        "hidden_dim": int(np.clip(np.round(vector[1] / 32) * 32, 32, 96)),
-        "dropout": float(np.clip(vector[2], 0.0, 0.35)),
-        "lr": float(10 ** np.clip(vector[3], -3.2, -2.0)),
+        "embedding_dim": int(embedding_values[np.argmin(np.abs(embedding_values - vector[0]))]),
+        "hidden_dim": int(hidden_values[np.argmin(np.abs(hidden_values - vector[1]))]),
+        "dropout": float(np.clip(vector[2], *HPO_DOMAIN["dropout"])),
+        "lr": float(10 ** np.clip(vector[3], *HPO_DOMAIN["log10_lr"])),
     }
 
 
 def run_de_search(bundle_cpu: GraphBundle, model_name: str, device: torch.device, seeds: tuple[int, ...] = SEEDS) -> list[dict]:
-    """Run a differential-evolution-style population search over hyperparameters."""
+    """Run DE-style search with 24 evaluations over the shared HPO domain."""
     rng, rows = np.random.default_rng(SEED), []
-    pop, gens = 6, 4 if bundle_cpu.name == "movielens_100k" else 3
-    bounds = np.array([[16, 48], [32, 96], [0.0, 0.35], [-3.2, -2.0]], dtype=float)
+    pop = 6
+    gens = (HPO_EVAL_BUDGET - pop) // pop
+    bounds = np.array(
+        [
+            [HPO_DOMAIN["embedding_dim"][0], HPO_DOMAIN["embedding_dim"][-1]],
+            [HPO_DOMAIN["hidden_dim"][0], HPO_DOMAIN["hidden_dim"][-1]],
+            list(HPO_DOMAIN["dropout"]),
+            list(HPO_DOMAIN["log10_lr"]),
+        ],
+        dtype=float,
+    )
     population = np.column_stack([rng.uniform(bounds[i, 0], bounds[i, 1], size=pop) for i in range(bounds.shape[0])])
     scores = []
     for cand in population:
@@ -1100,15 +1144,15 @@ def run_optimizer_suite(bundle_cpu: GraphBundle, device: torch.device, seeds: tu
     epochs = DEFAULT_CONFIG["optimizer_epochs_small"] if bundle_cpu.name == "movielens_100k" else DEFAULT_CONFIG["optimizer_epochs_large"]
     steps = DEFAULT_CONFIG["optimizer_steps_small"] if bundle_cpu.name == "movielens_100k" else DEFAULT_CONFIG["optimizer_steps_large"]
     model_name = "dnn" if bundle_cpu.task_type == "bipartite" else "gnn"
-    hparams = {"embedding_dim": 32, "hidden_dim": 64, "dropout": 0.2, "lr": 3e-3}
+    hparams = OPTIMIZER_HPARAMS.copy()
     rows = []
     for seed in seeds:
         rows.extend(
             [
                 _train_gradient(bundle_cpu, model_name, hparams, "adam", epochs, steps, "optimizer_training", device, seed=seed),
                 _train_gradient(bundle_cpu, model_name, hparams, "sgd", epochs, steps, "optimizer_training", device, seed=seed),
-                train_population_recommender(bundle_cpu, model_name, "pso", device, seed=seed),
-                train_population_recommender(bundle_cpu, model_name, "evolutionary", device, seed=seed),
+                train_population_recommender(bundle_cpu, model_name, "pso", hparams, device, seed=seed),
+                train_population_recommender(bundle_cpu, model_name, "evolutionary", hparams, device, seed=seed),
             ]
         )
     return rows

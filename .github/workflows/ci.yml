@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip check
+
+      - name: Compile Python sources
+        run: python -m py_compile src/experiment_suite.py tests/test_*.py
+
+      - name: Validate notebook structure
+        run: python -c "import json, pathlib; notebook = json.loads(pathlib.Path('src/recommender_optimization_experiments.ipynb').read_text(encoding='utf-8')); assert notebook['nbformat'] == 4; assert not [output for cell in notebook['cells'] for output in cell.get('outputs', []) if output.get('output_type') == 'error']"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
