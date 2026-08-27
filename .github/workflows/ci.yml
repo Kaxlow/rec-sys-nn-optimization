@@ -35,5 +35,8 @@ jobs:
       - name: Validate notebook structure
         run: python -c "import json, pathlib; notebook = json.loads(pathlib.Path('src/recommender_optimization_experiments.ipynb').read_text(encoding='utf-8')); assert notebook['nbformat'] == 4; assert not [output for cell in notebook['cells'] for output in cell.get('outputs', []) if output.get('output_type') == 'error']"
 
+      - name: Validate CURC batch script syntax
+        run: bash -n scripts/run_full_rtx_pro_6000.sh
+
       - name: Run unit tests
         run: python -m unittest discover -s tests -v

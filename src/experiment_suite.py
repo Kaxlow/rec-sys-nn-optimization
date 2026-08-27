@@ -58,6 +58,31 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def read_bool_env(name: str, default: bool) -> bool:
+    """Read a strict boolean environment variable used by batch experiments."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be one of true/false, 1/0, yes/no, or on/off; got {value!r}")
+
+
+def resolve_results_path(relative_path: str | os.PathLike[str]) -> Path:
+    """Resolve a result file below RESULTS_DIR and create its parent directory."""
+    requested = Path(relative_path)
+    if requested.is_absolute() or ".." in requested.parts:
+        raise ValueError(f"Result path must stay below {RESULTS_DIR}: {relative_path!r}")
+    resolved = (RESULTS_DIR / requested).resolve()
+    if not resolved.is_relative_to(RESULTS_DIR.resolve()):
+        raise ValueError(f"Result path must stay below {RESULTS_DIR}: {relative_path!r}")
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
 def set_seed(seed: int = SEED) -> None:
     """Seed Python, NumPy, and PyTorch for repeatable experiment runs."""
     random.seed(seed)
@@ -124,6 +149,10 @@ class ResourceTracker:
             self.peak_gpu_mb = max(self.peak_gpu_mb, gpu)
 
     def __enter__(self) -> "ResourceTracker":
+        if torch.cuda.is_available():
+            # CUDA launches asynchronously. Finish earlier work so this trial's
+            # wall-clock measurement starts at a well-defined boundary.
+            torch.cuda.synchronize()
         self.start_time = time.perf_counter()
         if psutil is not None:
             self.process = psutil.Process(os.getpid())
@@ -142,6 +171,9 @@ class ResourceTracker:
         self.tick()
 
     def summary(self) -> dict:
+        if torch.cuda.is_available():
+            # Include all queued GPU kernels in the recorded wall time.
+            torch.cuda.synchronize()
         cpu_user_sec = 0.0
         cpu_system_sec = 0.0
         if self.process is not None:

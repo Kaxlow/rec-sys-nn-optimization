@@ -2,7 +2,7 @@
 
 ## Manuscript
 
-[Download the current draft manuscript](A%20Comparison%20of%20Neural%20Recommender%20Systems%20-%20Draft%20Manuscript.pdf).
+[Download the current full-results manuscript](A%20Comparison%20of%20Neural%20Recommender%20System%20Architectures%20-%20Draft%20Manuscript.pdf).
 
 ## Status
 
@@ -12,10 +12,11 @@ The findings should be interpreted as preliminary and are subject to revision.
 
 ## Current version
 
-- Version date: August 22, 2026
+- Version date: August 25, 2026
 - Status: Draft manuscript
-- Experiment mode: `QUICK_MODE=True`
+- Experiment mode: `QUICK_MODE=False`
 - Trial count: Five seeds per reported comparison
+- Compute: NVIDIA RTX PRO 6000 Blackwell Server Edition, PyTorch 2.11.0+cu130, CUDA 13.0
 
 ## Relationship to this repository
 
@@ -26,17 +27,20 @@ materials are:
   experiment execution, summaries, and visualizations
 - [`../src/experiment_suite.py`](../src/experiment_suite.py):
   dataset preparation, models, training procedures, and search methods
+- [`../results/full_rtx_pro_6000/experiment_results.csv`](../results/full_rtx_pro_6000/experiment_results.csv):
+  primary full-data repeated-trial results
 - [`../results/experiment_results.csv`](../results/experiment_results.csv):
-  raw repeated-trial results
+  earlier quick-mode reproduction baseline
 - [`../README.md`](../README.md):
   setup instructions, experimental protocol, and headline findings
 
 ## Scope and limitations
 
-The reported experiments use quick-mode dataset sampling while retaining the
-configured training schedules. The model-family implementations are lightweight
-research proxies and should not be interpreted as exact reproductions of every
-referenced architecture.
+The current manuscript reports the completed full-data GPU run. The
+model-family implementations remain lightweight research proxies and should not
+be interpreted as exact reproductions of every referenced architecture. Full
+mode loads the full dataset bundles, but each fit still uses short schedules
+and sampled, balanced positive-negative mini-batches.
 
 The results are limited to the included datasets, sampled edge-prediction
 protocol, five random seeds, and the documented hardware and computational
@@ -55,13 +59,13 @@ a preprint, or formally published.
 
 ## Reproducibility
 
-See the repository’s [main README](../README.md) for environment setup and
-execution instructions. The committed CSV contains the results used by the
-current manuscript version.
+See the repository's [main README](../README.md) for environment setup and
+execution instructions. The full-results CSV contains the observations used by
+the current manuscript version.
 
 ## Review and feedback
 
-Academic feedback is welcome. Please use the repository’s issue tracker for
+Academic feedback is welcome. Please use the repository's issue tracker for
 technical questions or reproducibility problems.
 
 ## Rights
